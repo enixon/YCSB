@@ -5,4 +5,18 @@ db/*/lib/*.jar
 db/*/lib/*.zip
 *.iml
 .idea
+/cassandra/target/
+/core/target/
+/distribution/target/
+/gemfire/target/
+/hbase/target/
+/hypertable/target/
+/infinispan/target/
+/jdbc/target/
+/mapkeeper/target/
+/mongodb/target/
+/redis/target/
+/voldemort/target/
+/target
+*.log
 
