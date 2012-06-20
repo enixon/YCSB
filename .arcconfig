@@ -1,0 +1,6 @@
+{
+  "project_id" : "ycsb",
+  "conduit_uri" : "https://phabricator.fb.com/api/",
+  "remote_hooks_installed" : true
+}
+
