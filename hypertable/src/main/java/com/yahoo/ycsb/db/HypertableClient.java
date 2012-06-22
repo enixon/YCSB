@@ -17,14 +17,14 @@ package com.yahoo.ycsb.db;
 
 
 import java.nio.ByteBuffer;
-import java.util.ArrayList;
 import java.util.HashMap;
-import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.Vector;
 
 import org.apache.thrift.TException;
+import org.hypertable.thrift.SerializedCellsFlag;
+import org.hypertable.thrift.SerializedCellsWriter;
 import org.hypertable.thrift.ThriftClient;
 import org.hypertable.thriftgen.Cell;
 import org.hypertable.thriftgen.ClientException;
@@ -32,6 +32,7 @@ import org.hypertable.thriftgen.Key;
 import org.hypertable.thriftgen.KeyFlag;
 import org.hypertable.thriftgen.RowInterval;
 import org.hypertable.thriftgen.ScanSpec;
+import org.hypertable.thrift.SerializedCellsReader;
 
 import com.yahoo.ycsb.ByteArrayByteIterator;
 import com.yahoo.ycsb.ByteIterator;
@@ -53,7 +54,11 @@ public class HypertableClient extends com.yahoo.ycsb.DB
     public static final int SERVERERROR = -1;
     
     public static final String NAMESPACE = "/ycsb";
+    public static final int THRIFTBROKER_PORT = 38080;
 
+    //TODO: make dynamic
+    public static final int BUFFER_SIZE = 4096;
+    
     /**
      * Initialize any state for this DB.
      * Called once per DB instance; there is one DB instance per client thread.
@@ -67,9 +72,8 @@ public class HypertableClient extends com.yahoo.ycsb.DB
             _debug = true;
         }
         
-        //TODO: allow dynamic namespace specification?
         try {
-            connection = ThriftClient.create("localhost", 38080);
+            connection = ThriftClient.create("localhost", THRIFTBROKER_PORT);
             
             if (!connection.namespace_exists(NAMESPACE)) {
                 connection.namespace_create(NAMESPACE);
@@ -129,10 +133,6 @@ public class HypertableClient extends com.yahoo.ycsb.DB
                     _columnFamily);
             System.out.println("Doing read for key: " + key);
         }
-
-        List<Cell> values;
-        
-        //OPT: Use get_cells() call instead of scan?
         
         try {
             if (null != fields) {
@@ -144,17 +144,11 @@ public class HypertableClient extends com.yahoo.ycsb.DB
                 if (!resMap.isEmpty())
                     result.putAll(resMap.firstElement());
             } else {
-                values = connection.get_row(ns, table, key);
-                
-                for (Cell nextValue : values) {
-                    if (_debug) {
-                        System.out.println("Result for field: " + 
-                                nextValue.key.column_qualifier +
-                                " is: " + nextValue.value.toString());
-                    }
-                    if (0 != nextValue.value.remaining())
-                        result.put(nextValue.key.column_qualifier, 
-                                byteBufferToByteIterator(nextValue.value));
+                SerializedCellsReader reader = new SerializedCellsReader(null);
+                reader.reset(connection.get_row_serialized(ns, table, key));
+                while (reader.next()) {
+                    result.put(new String(reader.get_column_qualifier()), 
+                            new ByteArrayByteIterator(reader.get_value()));
                 }
             }
         } catch (ClientException e) {
@@ -169,17 +163,6 @@ public class HypertableClient extends com.yahoo.ycsb.DB
         }
 
         return OK;
-    }
-
-    /**
-     * Converts ByteBuffer type to ByteArrayByteIterator
-     * 
-     * @param bb A ByteBuffer
-     * @return An equivalent ByteArrayByteIterator
-     */
-    private ByteArrayByteIterator byteBufferToByteIterator(ByteBuffer bb) {
-        return new ByteArrayByteIterator(bb.array(), 
-                bb.position(), bb.limit() - bb.position()); 
     }
     
     /**
@@ -214,22 +197,31 @@ public class HypertableClient extends com.yahoo.ycsb.DB
         }
         spec.setVersions(1);
         spec.setRow_limit(recordcount);
-        
-        long sc;
+
+        SerializedCellsReader reader = new SerializedCellsReader(null);
+
         try {
-            sc = connection.scanner_open(ns, table, spec);
-            
-            int counter = 0;
+            long sc = connection.scanner_open(ns, table, spec);
+                        
             String lastRow = null;
-            while (counter < recordcount) {
-                List<Cell> nextRow = connection.scanner_get_cells(sc);
-                if (nextRow.isEmpty())
-                    break;
-                lastRow = parseCellList(nextRow, result, lastRow);
-                counter++;
+            boolean eos = false;
+            while (!eos) {
+                reader.reset(connection.scanner_get_cells_serialized(sc));
+                while (reader.next()) {
+                    String currentRow = new String(reader.get_row());
+                    if (!currentRow.equals(lastRow)) {
+                        result.add(new HashMap<String, ByteIterator>());
+                        lastRow = currentRow;
+                    }
+                    result.lastElement().put(
+                            new String(reader.get_column_qualifier()), 
+                            new ByteArrayByteIterator(reader.get_value()));
+                }
+                eos = reader.eos();
+                
+
                 if (_debug) {
-                    System.out.println("Number of calls made: " + counter);
-                    System.out.println("Number of cells retrieved: " + 
+                    System.out.println("Number of rows retrieved so far: " + 
                                         result.size());
                 }
             }
@@ -247,38 +239,6 @@ public class HypertableClient extends com.yahoo.ycsb.DB
         
         return OK;
     }
-
-    /**
-     * Helper function for scan. Parses a List<Cell> into the right format for 
-     * scan's results Vector
-     *
-     * @param values A list of Cells containing table values to be entered 
-     *     into result
-     * @param result A Vector of HashMaps, where each HashMap is a set 
-     *     field/value pairs for one record
-     * @param rowName Contains the name of the row corresponding for the 
-     *     pairs in result.lastElement()
-     */
-    private String parseCellList(List<Cell> values, 
-                                 Vector<HashMap<String, ByteIterator>> result, 
-                                 String rowName) 
-    {
-        for (Cell value : values) {
-            if (result.isEmpty() || !value.key.getRow().equals(rowName)) {
-                result.add(new HashMap<String, ByteIterator>());
-                rowName = value.key.getRow();
-            }
-            result.lastElement().put(value.key.column_qualifier, 
-                    byteBufferToByteIterator(value.value));
-            if (_debug) {
-                System.out.println("Result for field: " + 
-                        value.key.column_qualifier +
-                        " is: " + value.value.toString());
-            }
-        }
-        return rowName;
-    }
-
 
     /**
      * Update a record in the database. Any field/value pairs in the specified 
@@ -311,33 +271,25 @@ public class HypertableClient extends com.yahoo.ycsb.DB
     public int insert(String table, String key, 
             HashMap<String, ByteIterator> values)
     {
-        //TODO: create the table if none exists?
-        
+        //INSERT INTO table VALUES 
+        //  (key, _column_family:entry,getKey(), entry.getValue()), (...);
+
         if (_debug) {
             System.out.println("Setting up put for key: " + key);
         }
         
-        //INSERT INTO table VALUES 
-        //  (key, _column_family:entry,getKey(), entry.getValue()), (...);
-
-        List<Cell> cells = new ArrayList<Cell>();
-        for (Map.Entry<String, ByteIterator> entry : values.entrySet()) {
-            if (_debug) {
-                System.out.println("Adding field/value " + entry.getKey() + 
-                        "/" + entry.getValue() + " to put request");
-            }
-            Cell nextInsert = new Cell();
-            nextInsert.key = new Key();
-            nextInsert.value = ByteBuffer.wrap(entry.getValue().toArray());
-            nextInsert.key.row = key;
-            nextInsert.key.column_family = _columnFamily;
-            nextInsert.key.column_qualifier = entry.getKey();;
-            nextInsert.key.flag = KeyFlag.INSERT;
-            cells.add(nextInsert);
-        }
-        
         try {
-            connection.set_cells(ns, table, cells);
+            long mutator = connection.mutator_open(ns, table, 0, 0);
+            SerializedCellsWriter writer = 
+                    new SerializedCellsWriter(BUFFER_SIZE*values.size(), true);
+            for (Map.Entry<String, ByteIterator> entry : values.entrySet()) {
+                writer.add(key, _columnFamily, entry.getKey(), 
+                        SerializedCellsFlag.AUTO_ASSIGN, 
+                        ByteBuffer.wrap(entry.getValue().toArray()));            
+            }
+            connection.mutator_set_cells_serialized(mutator, 
+                    writer.buffer(), true);
+            connection.mutator_close(mutator);
         } catch (ClientException e) {
             if (_debug) {
                 System.err.println("Error doing set: " + e.message);
@@ -372,7 +324,6 @@ public class HypertableClient extends com.yahoo.ycsb.DB
         entry.key = new Key();
         entry.key.row = key;
         entry.key.flag = KeyFlag.DELETE_ROW;
-        entry.key.column_family = _columnFamily;  //necessary?
         
         try {
             connection.set_cell(ns, table, entry);
